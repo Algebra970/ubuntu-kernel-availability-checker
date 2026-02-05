@@ -34,6 +34,9 @@ class Color:
     END = '\033[0m'
 
 
+SEPARATOR = '=' * 70
+
+
 def get_cache_dir() -> Path:
     """
     Get or create the cache directory
@@ -44,6 +47,24 @@ def get_cache_dir() -> Path:
     cache_dir = Path.cwd() / 'cache'
     cache_dir.mkdir(exist_ok=True)
     return cache_dir
+
+
+def build_package_url(ubuntu_version: str, pocket: str, component: str, arch: str = 'amd64') -> str:
+    """
+    Build the URL for a packages file
+
+    Args:
+        ubuntu_version: Ubuntu codename
+        pocket: Repository pocket
+        component: Repository component
+        arch: Architecture (default: amd64)
+
+    Returns:
+        URL to the Packages.gz file
+    """
+    if pocket == 'main':
+        return f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}/{component}/binary-{arch}/Packages.gz"
+    return f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}-{pocket}/{component}/binary-{arch}/Packages.gz"
 
 
 def get_cache_path(ubuntu_version: str, pocket: str, component: str) -> Path:
@@ -80,11 +101,7 @@ def is_cache_current(ubuntu_version: str, pocket: str, component: str, arch: str
     if not cache_path.exists():
         return False
 
-    # Build the URL
-    if pocket == 'main':
-        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}/{component}/binary-{arch}/Packages.gz"
-    else:
-        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}-{pocket}/{component}/binary-{arch}/Packages.gz"
+    url = build_package_url(ubuntu_version, pocket, component, arch)
 
     try:
         # Make HEAD request to get Last-Modified header
@@ -99,8 +116,6 @@ def is_cache_current(ubuntu_version: str, pocket: str, component: str, arch: str
             from email.utils import parsedate_to_datetime
             server_time = parsedate_to_datetime(server_modified).timestamp()
             cache_time = cache_path.stat().st_mtime
-
-            # Cache is current if it's newer than or equal to server's file
             return cache_time >= server_time
     except Exception:
         # If HEAD request fails, assume cache is current to avoid re-downloading
@@ -203,11 +218,7 @@ def download_packages_file(ubuntu_version: str, pocket: str = 'main',
         if cached_content:
             return cached_content
 
-    # Build the URL based on the pocket
-    if pocket == 'main':
-        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}/{component}/binary-{arch}/Packages.gz"
-    else:
-        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}-{pocket}/{component}/binary-{arch}/Packages.gz"
+    url = build_package_url(ubuntu_version, pocket, component, arch)
 
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
@@ -235,6 +246,18 @@ def download_packages_file(ubuntu_version: str, pocket: str = 'main',
         return None
 
 
+def _store_package(packages: Dict, package_info: Dict) -> None:
+    """
+    Store a parsed package entry in the packages dictionary
+
+    Args:
+        packages: Dictionary to store the package in
+        package_info: Package metadata to store
+    """
+    if package_info and 'Package' in package_info:
+        packages[package_info['Package']] = package_info
+
+
 def parse_packages_file(content: str) -> Dict[str, Dict[str, any]]:
     """
     Parse Ubuntu Packages file content
@@ -251,23 +274,16 @@ def parse_packages_file(content: str) -> Dict[str, Dict[str, any]]:
     for line in content.split('\n'):
         if line.strip() == '':
             # Empty line marks end of a package entry
-            if current_package and 'Package' in current_package:
-                pkg_name = current_package['Package']
-                packages[pkg_name] = current_package
+            _store_package(packages, current_package)
             current_package = {}
         else:
             # Parse key-value pairs
             if ':' in line:
                 key, value = line.split(':', 1)
-                key = key.strip()
-                value = value.strip()
-                current_package[key] = value
+                current_package[key.strip()] = value.strip()
 
     # Don't forget the last package
-    if current_package and 'Package' in current_package:
-        pkg_name = current_package['Package']
-        packages[pkg_name] = current_package
-
+    _store_package(packages, current_package)
     return packages
 
 
@@ -296,6 +312,22 @@ def parse_dependencies(depends_str: str) -> List[str]:
     return deps
 
 
+def print_verdict(success: bool) -> None:
+    """
+    Print final verdict based on check result
+
+    Args:
+        success: Whether all checks passed
+    """
+    if success:
+        print(f"{Color.GREEN}{Color.BOLD}✓ ALL CHECKS PASSED{Color.END}")
+        print(f"{Color.GREEN}  The kernel package and all dependencies are available.{Color.END}")
+    else:
+        print(f"{Color.RED}{Color.BOLD}✗ ISSUES DETECTED:{Color.END}")
+        print(f"{Color.RED}  The kernel package or its dependencies have availability problems.{Color.END}")
+        print(f"{Color.RED}  Fresh installations may fail!{Color.END}")
+
+
 def get_package_info(packages: Dict[str, Dict], name: str) -> Optional[Dict[str, any]]:
     """
     Get information about a specific package
@@ -308,6 +340,42 @@ def get_package_info(packages: Dict[str, Dict], name: str) -> Optional[Dict[str,
         Package metadata dictionary or None if not found
     """
     return packages.get(name)
+
+
+def check_and_collect_missing_deps(packages: Dict[str, Dict],
+                                    deps_to_check: list,
+                                    verbose: bool = False) -> List[str]:
+    """
+    Check a list of dependencies and collect missing ones
+
+    Args:
+        packages: Dictionary of all packages
+        deps_to_check: List of package names to check
+        verbose: Print verbose output
+
+    Returns:
+        List of missing package names
+    """
+    missing = []
+
+    for i, dep in enumerate(deps_to_check, 1):
+        if verbose:
+            print(f"{i}. Checking {dep}...", end=' ')
+
+        all_available, dep_missing, dep_unavailable = check_dependencies_recursive(packages, dep)
+
+        if all_available:
+            if verbose:
+                print(f"{Color.GREEN}✓{Color.END}")
+        else:
+            missing.extend(dep_missing)
+            missing.extend(dep_unavailable)
+            if verbose:
+                print(f"{Color.RED}✗{Color.END}")
+                if dep_missing:
+                    print(f"   Missing: {', '.join(set(dep_missing))}")
+
+    return missing
 
 
 def check_dependencies_recursive(packages: Dict[str, Dict],
@@ -382,10 +450,10 @@ def check_kernel_package(package: str = 'linux-generic',
     if components is None:
         components = ['main', 'restricted', 'universe', 'multiverse']
 
-    print(f"{Color.BOLD}{'=' * 70}{Color.END}")
+    print(f"{Color.BOLD}{SEPARATOR}{Color.END}")
     print(f"{Color.BOLD}Ubuntu Kernel Package Availability Checker{Color.END}")
     print(f"{Color.BOLD}(Querying archive.ubuntu.com directly){Color.END}")
-    print(f"{Color.BOLD}{'=' * 70}{Color.END}\n")
+    print(f"{Color.BOLD}{SEPARATOR}{Color.END}\n")
 
     # Detect Ubuntu version if not provided
     if not ubuntu_version:
@@ -455,34 +523,16 @@ def check_kernel_package(package: str = 'linux-generic',
 
     if 'Depends' not in info:
         print(f"{Color.YELLOW}No dependencies found{Color.END}\n")
-        print(f"{Color.BOLD}{'=' * 70}{Color.END}")
-        print(f"{Color.GREEN}{Color.BOLD}✓ ALL CHECKS PASSED{Color.END}")
-        print(f"{Color.GREEN}  The kernel package and all dependencies are available.{Color.END}")
+        print(f"{Color.BOLD}{SEPARATOR}{Color.END}")
+        print_verdict(True)
         return True
 
     all_deps = parse_dependencies(info['Depends'])
     print(f"Found {len(all_deps)} direct dependencies\n")
 
     # Check each dependency and all their sub-dependencies
-    repo_missing_deps = []
     all_checked_deps = set(all_deps)  # Track all dependencies we've checked
-
-    for i, dep in enumerate(all_deps, 1):
-        if verbose:
-            print(f"{i}. Checking {dep}...", end=' ')
-
-        all_available, missing, unavailable = check_dependencies_recursive(packages, dep)
-
-        if all_available:
-            if verbose:
-                print(f"{Color.GREEN}✓{Color.END}")
-        else:
-            repo_missing_deps.extend(missing)
-            repo_missing_deps.extend(unavailable)
-            if verbose:
-                print(f"{Color.RED}✗{Color.END}")
-                if missing:
-                    print(f"   Missing: {', '.join(set(missing))}")
+    repo_missing_deps = check_and_collect_missing_deps(packages, all_deps, verbose)
 
     # If recursive flag is set, check all transitive dependencies
     if recursive:
@@ -512,19 +562,10 @@ def check_kernel_package(package: str = 'linux-generic',
 
         print(f"Found {len(all_transitive_deps)} total transitive dependencies\n")
 
-        # Check each transitive dependency
-        for i, dep in enumerate(sorted(all_transitive_deps), 1):
-            if dep in all_deps:
-                continue  # Already checked direct deps
-
-            if verbose and i % 50 == 0:
-                print(f"Checked {i} transitive dependencies...", end='\r')
-
-            all_available, missing, unavailable = check_dependencies_recursive(packages, dep)
-
-            if not all_available:
-                repo_missing_deps.extend(missing)
-                repo_missing_deps.extend(unavailable)
+        # Check each transitive dependency (exclude already-checked direct deps)
+        transitive_only = [d for d in sorted(all_transitive_deps) if d not in all_deps]
+        transitive_missing = check_and_collect_missing_deps(packages, transitive_only, verbose)
+        repo_missing_deps.extend(transitive_missing)
 
     # Remove duplicates
     repo_missing_deps = list(set(repo_missing_deps))
@@ -570,16 +611,10 @@ def check_kernel_package(package: str = 'linux-generic',
             print(f"  {source}: {len(by_source[source])} package(s)")
 
     # Final verdict
-    print(f"\n{Color.BOLD}{'=' * 70}{Color.END}")
-    if repo_missing_deps:
-        print(f"{Color.RED}{Color.BOLD}✗ ISSUES DETECTED:{Color.END}")
-        print(f"{Color.RED}  The kernel package or its dependencies have availability problems.{Color.END}")
-        print(f"{Color.RED}  Fresh installations may fail!{Color.END}")
-        return False
-    else:
-        print(f"{Color.GREEN}{Color.BOLD}✓ ALL CHECKS PASSED{Color.END}")
-        print(f"{Color.GREEN}  The kernel package and all dependencies are available.{Color.END}")
-        return True
+    print(f"\n{Color.BOLD}{SEPARATOR}{Color.END}")
+    success = not bool(repo_missing_deps)
+    print_verdict(success)
+    return success
 
 
 def main():
