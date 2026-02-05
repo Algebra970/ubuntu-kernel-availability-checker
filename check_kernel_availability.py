@@ -326,15 +326,16 @@ def compare_versions(v1: str, v2: str) -> int:
     return 0
 
 
-def parse_dependencies(depends_str: str) -> List[str]:
+def parse_dependencies(depends_str: str) -> List[Tuple[str, Optional[str]]]:
     """
-    Parse Depends field from package metadata
+    Parse Depends field from package metadata with version constraints
 
     Args:
         depends_str: Dependencies string (e.g., "pkg1 (>= 1.0), pkg2 | pkg3")
 
     Returns:
-        List of package names (first alternative of each OR group)
+        List of tuples (package_name, version_constraint) where version_constraint
+        is the version requirement or None if no constraint
     """
     deps = []
 
@@ -343,10 +344,17 @@ def parse_dependencies(depends_str: str) -> List[str]:
         group = group.strip()
         # Take first alternative (before |)
         primary = group.split('|')[0].strip()
-        # Remove version constraint
-        primary = re.sub(r'\s*\([^)]*\)', '', primary).strip()
-        if primary:
-            deps.append(primary)
+
+        # Extract version constraint if present
+        constraint_match = re.search(r'\s*\(([^)]*)\)', primary)
+        version_constraint = None
+        if constraint_match:
+            version_constraint = constraint_match.group(1)
+
+        # Extract package name (before the constraint)
+        pkg_name = re.sub(r'\s*\([^)]*\)', '', primary).strip()
+        if pkg_name:
+            deps.append((pkg_name, version_constraint))
 
     return deps
 
@@ -383,52 +391,75 @@ def get_package_info(packages: Dict[str, Dict], name: str) -> Optional[Dict[str,
 
 def check_and_collect_missing_deps(packages: Dict[str, Dict],
                                     deps_to_check: list,
-                                    verbose: bool = False) -> List[str]:
+                                    verbose: bool = False,
+                                    latest_versions: Optional[Dict[str, str]] = None) -> List[str]:
     """
     Check a list of dependencies and collect missing ones
 
     Args:
         packages: Dictionary of all packages
-        deps_to_check: List of package names to check
+        deps_to_check: List of tuples (package_name, version_constraint) to check
         verbose: Print verbose output
+        latest_versions: Dictionary mapping package names to their latest versions
 
     Returns:
         List of missing package names
     """
     missing = []
 
-    for i, dep in enumerate(deps_to_check, 1):
+    for i, (dep_name, constraint) in enumerate(deps_to_check, 1):
         if verbose:
-            print(f"{i}. Checking {dep}...", end=' ')
+            print(f"{i}. Checking {dep_name}...", end=' ')
 
-        all_available, dep_missing, dep_unavailable = check_dependencies_recursive(packages, dep)
+        # Extract version from equality constraint if present
+        requested_version = None
+        if constraint and constraint.startswith('='):
+            requested_version = constraint.split('=', 1)[1].strip()
 
-        if all_available:
-            if verbose:
-                print(f"{Color.GREEN}✓{Color.END}")
-        else:
-            missing.extend(dep_missing)
-            missing.extend(dep_unavailable)
+        # Check if package exists with the required version
+        dep_info = get_package_by_version(packages, dep_name, requested_version, latest_versions)
+        if not dep_info:
+            # Dependency not found with required version
+            if requested_version:
+                missing.append(f"{dep_name} (version {requested_version})")
+            else:
+                missing.append(dep_name)
             if verbose:
                 print(f"{Color.RED}✗{Color.END}")
-                if dep_missing:
-                    print(f"   Missing: {', '.join(set(dep_missing))}")
+            continue
+
+        if verbose:
+            print(f"{Color.GREEN}✓{Color.END}")
+
+        # Recursively check this dependency's dependencies with the requested version
+        all_available, dep_missing, dep_unavailable = check_dependencies_recursive(
+            packages, dep_name, requested_version, latest_versions=latest_versions
+        )
+        if not all_available:
+            missing.extend(dep_missing)
+            missing.extend(dep_unavailable)
+            if verbose and dep_missing:
+                print(f"   Missing: {', '.join(set(dep_missing))}")
 
     return missing
 
 
-def check_dependencies_recursive(packages: Dict[str, Dict],
+def check_dependencies_recursive(packages: Dict[str, Dict[str, Dict]],
                                  package_name: str,
+                                 requested_version: Optional[str] = None,
                                  visited: Set[str] = None,
-                                 depth: int = 0) -> Tuple[bool, List[str], List[str]]:
+                                 depth: int = 0,
+                                 latest_versions: Optional[Dict[str, str]] = None) -> Tuple[bool, List[str], List[str]]:
     """
     Recursively check if a package and all its dependencies are available
 
     Args:
-        packages: Dictionary of all packages
+        packages: Dictionary of all packages {name: {version: info}}
         package_name: Package to check
+        requested_version: Specific version to check (None for latest)
         visited: Set of already-visited packages (to avoid circular deps)
         depth: Current recursion depth
+        latest_versions: Dictionary mapping package names to their latest versions
 
     Returns:
         Tuple of (all_available, missing_packages, unavailable_packages)
@@ -442,10 +473,11 @@ def check_dependencies_recursive(packages: Dict[str, Dict],
 
     visited.add(package_name)
 
-    # Check if package exists
-    info = get_package_info(packages, package_name)
+    # Check if package exists with the requested version
+    info = get_package_by_version(packages, package_name, requested_version, latest_versions)
     if not info:
-        return False, [package_name], []
+        version_str = f" (version {requested_version})" if requested_version else ""
+        return False, [f"{package_name}{version_str}"], []
 
     missing = []
     unavailable = []
@@ -454,9 +486,16 @@ def check_dependencies_recursive(packages: Dict[str, Dict],
     # Check dependencies if they exist
     if 'Depends' in info:
         deps = parse_dependencies(info['Depends'])
-        for dep in deps:
+        for dep_name, constraint in deps:
+            # If there's an equality constraint, use that specific version
+            dep_requested_version = None
+            if constraint and constraint.startswith('='):
+                # Extract version from constraint like "= 1.0" or "= 1.0-1"
+                dep_requested_version = constraint.split('=', 1)[1].strip()
+
+            # Recursively check this dependency with the version constraint
             dep_available, dep_missing, dep_unavailable = check_dependencies_recursive(
-                packages, dep, visited.copy(), depth + 1
+                packages, dep_name, dep_requested_version, visited.copy(), depth + 1, latest_versions
             )
             if not dep_available:
                 all_available = False
@@ -466,8 +505,42 @@ def check_dependencies_recursive(packages: Dict[str, Dict],
     return all_available, missing, unavailable
 
 
+def get_package_by_version(packages: Dict[str, Dict[str, Dict]], name: str, version: Optional[str] = None,
+                           latest_versions: Optional[Dict[str, str]] = None) -> Optional[Dict]:
+    """
+    Get a specific version of a package or the latest if version is None
+
+    Args:
+        packages: Dictionary of all packages {name: {version: info}}
+        name: Package name
+        version: Specific version to find (None for latest)
+        latest_versions: Dictionary mapping package names to their latest versions
+
+    Returns:
+        Package metadata or None if not found
+    """
+    if name not in packages:
+        return None
+
+    versions_dict = packages[name]
+    if not versions_dict:
+        return None
+
+    if version is None:
+        # Return the latest version if we have that info
+        if latest_versions and name in latest_versions:
+            latest_ver = latest_versions[name]
+            return versions_dict.get(latest_ver)
+        # Fallback: return any version (shouldn't happen in normal operation)
+        return next(iter(versions_dict.values()))
+
+    # Return specific version if it exists
+    return versions_dict.get(version)
+
+
 def check_kernel_package(package: str = 'linux-generic',
                         ubuntu_version: Optional[str] = None,
+                        package_version: Optional[str] = None,
                         verbose: bool = False,
                         recursive: bool = False,
                         components: Optional[List[str]] = None,
@@ -478,6 +551,7 @@ def check_kernel_package(package: str = 'linux-generic',
     Args:
         package: Package to check (default: linux-generic)
         ubuntu_version: Ubuntu version to check (auto-detect if None)
+        package_version: Specific package version to check (None for latest)
         verbose: Print verbose output
         recursive: Check all transitive dependencies recursively
         components: List of components to check (default: all)
@@ -510,8 +584,9 @@ def check_kernel_package(package: str = 'linux-generic',
     # Download packages from all pockets and components
     print(f"{Color.CYAN}Downloading packages from repository...{Color.END}")
     pockets = ['main', 'security', 'updates']
-    all_packages = {}
-    package_sources = {}  # Track which component/pocket each package comes from
+    all_packages = {}  # {name: {version: info}}
+    package_sources = {}  # {name: {version: source}}
+    latest_versions = {}  # {name: latest_version}
 
     download_count = 0
 
@@ -520,19 +595,25 @@ def check_kernel_package(package: str = 'linux-generic',
             packages_content = download_packages_file(ubuntu_version, pocket, component=component, use_cache=use_cache)
             if packages_content:
                 pocket_packages = parse_packages_file(packages_content)
-                # Merge packages, preferring newer versions
+                # Merge packages, storing all versions
                 for pkg_name, pkg_info in pocket_packages.items():
+                    version = pkg_info.get('Version', '')
+
+                    # Initialize package if not seen before
                     if pkg_name not in all_packages:
-                        all_packages[pkg_name] = pkg_info
-                        package_sources[pkg_name] = f"{component}/{pocket}"
-                    else:
-                        # Compare versions and keep the newer one
-                        existing_version = all_packages[pkg_name].get('Version', '')
-                        new_version = pkg_info.get('Version', '')
-                        if compare_versions(existing_version, new_version) < 0:
-                            # New version is newer
-                            all_packages[pkg_name] = pkg_info
-                            package_sources[pkg_name] = f"{component}/{pocket}"
+                        all_packages[pkg_name] = {}
+                        package_sources[pkg_name] = {}
+                        latest_versions[pkg_name] = version
+
+                    # Store this version if we haven't seen it
+                    if version not in all_packages[pkg_name]:
+                        all_packages[pkg_name][version] = pkg_info
+                        package_sources[pkg_name][version] = f"{component}/{pocket}"
+
+                        # Update latest version if this is newer
+                        if compare_versions(latest_versions[pkg_name], version) < 0:
+                            latest_versions[pkg_name] = version
+
                 download_count += 1
                 if not verbose:
                     print(f"  {Color.GREEN}✓{Color.END} {component:12} / {pocket:8} - {len(pocket_packages):5} packages")
@@ -548,15 +629,26 @@ def check_kernel_package(package: str = 'linux-generic',
     packages = all_packages
 
     # Check main package
-    print(f"{Color.CYAN}Checking package: {Color.BOLD}{package}{Color.END}")
-    info = get_package_info(packages, package)
+    if package_version:
+        print(f"{Color.CYAN}Checking package: {Color.BOLD}{package}{Color.END} (version {package_version})")
+    else:
+        print(f"{Color.CYAN}Checking package: {Color.BOLD}{package}{Color.END} (latest)")
+
+    info = get_package_by_version(packages, package, package_version, latest_versions)
 
     if not info:
-        print(f"{Color.RED}✗ Package '{package}' not found in repository!{Color.END}\n")
+        if package_version:
+            print(f"{Color.RED}✗ Package '{package}' version '{package_version}' not found in repository!{Color.END}\n")
+            # Show available versions
+            pkg_info = get_package_info(packages, package)
+            if pkg_info:
+                print(f"{Color.YELLOW}Available version: {pkg_info.get('Version', 'unknown')}{Color.END}\n")
+        else:
+            print(f"{Color.RED}✗ Package '{package}' not found in repository!{Color.END}\n")
         return False
 
     version = info.get('Version', 'unknown')
-    source = package_sources.get(package, 'unknown')
+    source = package_sources.get(package, {}).get(version, 'unknown')
     print(f"{Color.GREEN}✓ Package found{Color.END}")
     print(f"  Version: {Color.BOLD}{version}{Color.END}")
     print(f"  Source: {source}")
@@ -574,41 +666,48 @@ def check_kernel_package(package: str = 'linux-generic',
     all_deps = parse_dependencies(info['Depends'])
     print(f"Found {len(all_deps)} direct dependencies\n")
 
+    # Extract just the package names for tracking
+    all_deps_names = [name for name, _ in all_deps]
+
     # Check each dependency and all their sub-dependencies
-    all_checked_deps = set(all_deps)  # Track all dependencies we've checked
-    repo_missing_deps = check_and_collect_missing_deps(packages, all_deps, verbose)
+    all_checked_deps = set(all_deps_names)  # Track all dependencies we've checked
+    repo_missing_deps = check_and_collect_missing_deps(packages, all_deps, verbose, latest_versions)
 
     # If recursive flag is set, check all transitive dependencies
     if recursive:
         print(f"\n{Color.CYAN}Performing full recursive dependency check...{Color.END}\n")
 
         # Build a complete dependency tree
-        def collect_all_deps(pkg_name: str, visited: Set[str] = None) -> Set[str]:
+        def collect_all_deps(pkg_name: str, requested_version: Optional[str] = None, visited: Set[str] = None) -> Set[str]:
             if visited is None:
                 visited = set()
             if pkg_name in visited:
                 return set()
             visited.add(pkg_name)
 
-            info = get_package_info(packages, pkg_name)
+            info = get_package_by_version(packages, pkg_name, requested_version, latest_versions)
             if not info or 'Depends' not in info:
                 return set()
 
             deps = parse_dependencies(info['Depends'])
-            result = set(deps)
-            for dep in deps:
-                result.update(collect_all_deps(dep, visited.copy()))
+            result = set(dep_name for dep_name, _ in deps)
+            for dep_name, constraint in deps:
+                # Extract version from constraint if present
+                dep_requested_version = None
+                if constraint and constraint.startswith('='):
+                    dep_requested_version = constraint.split('=', 1)[1].strip()
+                result.update(collect_all_deps(dep_name, dep_requested_version, visited.copy()))
             return result
 
-        # Collect all transitive dependencies
-        all_transitive_deps = collect_all_deps(package)
+        # Collect all transitive dependencies with the requested version
+        all_transitive_deps = collect_all_deps(package, package_version)
         all_checked_deps.update(all_transitive_deps)
 
         print(f"Found {len(all_transitive_deps)} total transitive dependencies\n")
 
         # Check each transitive dependency (exclude already-checked direct deps)
-        transitive_only = [d for d in sorted(all_transitive_deps) if d not in all_deps]
-        transitive_missing = check_and_collect_missing_deps(packages, transitive_only, verbose)
+        transitive_only = [(d, None) for d in sorted(all_transitive_deps) if d not in all_deps_names]
+        transitive_missing = check_and_collect_missing_deps(packages, transitive_only, verbose, latest_versions)
         repo_missing_deps.extend(transitive_missing)
 
     # Remove duplicates
@@ -643,13 +742,30 @@ def check_kernel_package(package: str = 'linux-generic',
     if verbose and not repo_missing_deps:
         print(f"\n{Color.CYAN}{Color.BOLD}Dependency Sources:{Color.END}")
         by_source = {}
-        for i, dep in enumerate(all_deps, 1):
-            all_available, missing, unavailable = check_dependencies_recursive(packages, dep)
+        for i, (dep_name, constraint) in enumerate(all_deps, 1):
+            # Extract version from constraint if present
+            requested_version = None
+            if constraint and constraint.startswith('='):
+                requested_version = constraint.split('=', 1)[1].strip()
+
+            all_available, missing, unavailable = check_dependencies_recursive(
+                packages, dep_name, requested_version, latest_versions=latest_versions
+            )
             if all_available:
-                source = package_sources.get(dep, 'unknown')
-                if source not in by_source:
-                    by_source[source] = []
-                by_source[source].append(dep)
+                dep_versions = packages.get(dep_name, {})
+                if dep_versions:
+                    # Get the version we used
+                    if requested_version:
+                        dep_version = requested_version
+                    elif dep_name in latest_versions:
+                        dep_version = latest_versions[dep_name]
+                    else:
+                        dep_version = next(iter(dep_versions.keys()))
+
+                    source = package_sources.get(dep_name, {}).get(dep_version, 'unknown')
+                    if source not in by_source:
+                        by_source[source] = []
+                    by_source[source].append(dep_name)
 
         for source in sorted(by_source.keys()):
             print(f"  {source}: {len(by_source[source])} package(s)")
@@ -674,6 +790,9 @@ Examples:
   # Check a specific package
   python3 check_kernel_availability.py --package linux-image-generic
 
+  # Check a specific package version
+  python3 check_kernel_availability.py --package-version 6.8.0-31.31
+
   # Check against specific Ubuntu version
   python3 check_kernel_availability.py --ubuntu-version focal
 
@@ -691,6 +810,9 @@ Examples:
 
   # Combine multiple flags
   python3 check_kernel_availability.py -r -v --ubuntu-version jammy --components main restricted
+
+  # Check specific package version with recursive dependencies
+  python3 check_kernel_availability.py -pv 6.8.0-31.31 -r
         """
     )
 
@@ -698,6 +820,12 @@ Examples:
         '--package', '-p',
         default='linux-generic',
         help='Package to check (default: linux-generic)'
+    )
+
+    parser.add_argument(
+        '--package-version', '-pv',
+        default=None,
+        help='Specific package version to check (default: latest available)'
     )
 
     parser.add_argument(
@@ -735,7 +863,15 @@ Examples:
     args = parser.parse_args()
 
     # Run the check
-    success = check_kernel_package(args.package, args.ubuntu_version, args.verbose, args.recursive, args.components, not args.no_cache)
+    success = check_kernel_package(
+        args.package,
+        args.ubuntu_version,
+        args.package_version,
+        args.verbose,
+        args.recursive,
+        args.components,
+        not args.no_cache
+    )
 
     # Exit with appropriate code
     sys.exit(0 if success else 1)
