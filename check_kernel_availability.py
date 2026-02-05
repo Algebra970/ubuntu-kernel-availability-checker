@@ -544,6 +544,7 @@ def check_kernel_package(package: str = 'linux-generic',
                         verbose: bool = False,
                         recursive: bool = False,
                         components: Optional[List[str]] = None,
+                        pockets: Optional[List[str]] = None,
                         use_cache: bool = True) -> bool:
     """
     Main function to check kernel package and dependencies
@@ -555,6 +556,7 @@ def check_kernel_package(package: str = 'linux-generic',
         verbose: Print verbose output
         recursive: Check all transitive dependencies recursively
         components: List of components to check (default: all)
+        pockets: List of pockets to check (default: main, security, updates)
         use_cache: Use cached data if available (default: True)
 
     Returns:
@@ -562,6 +564,8 @@ def check_kernel_package(package: str = 'linux-generic',
     """
     if components is None:
         components = ['main', 'restricted', 'universe', 'multiverse']
+    if pockets is None:
+        pockets = ['main', 'security', 'updates']
 
     print(f"{Color.BOLD}{SEPARATOR}{Color.END}")
     print(f"{Color.BOLD}Ubuntu Kernel Package Availability Checker{Color.END}")
@@ -583,7 +587,6 @@ def check_kernel_package(package: str = 'linux-generic',
 
     # Download packages from all pockets and components
     print(f"{Color.CYAN}Downloading packages from repository...{Color.END}")
-    pockets = ['main', 'security', 'updates']
     all_packages = {}  # {name: {version: info}}
     package_sources = {}  # {name: {version: source}}
     latest_versions = {}  # {name: latest_version}
@@ -799,6 +802,12 @@ Examples:
   # Check only specific components
   python3 check_kernel_availability.py --components main universe
 
+  # Check only specific pockets (e.g., only 'updates' pocket)
+  python3 check_kernel_availability.py --pockets updates
+
+  # Check security and updates pockets only
+  python3 check_kernel_availability.py -P security updates
+
   # Full recursive check of all transitive dependencies
   python3 check_kernel_availability.py --recursive
 
@@ -843,6 +852,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--pockets', '-P',
+        nargs='+',
+        default=['main', 'security', 'updates'],
+        choices=['main', 'security', 'updates', 'proposed'],
+        help='Repository pockets to check (default: main security updates)'
+    )
+
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose output'
@@ -870,6 +887,7 @@ Examples:
         args.verbose,
         args.recursive,
         args.components,
+        args.pockets,
         not args.no_cache
     )
 
