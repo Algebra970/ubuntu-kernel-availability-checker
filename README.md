@@ -18,7 +18,10 @@ This tool detects these availability issues by querying the repository metadata 
 - **Direct Repository Queries**: Downloads and parses package metadata from archive.ubuntu.com without using local apt tools
 - **Full Component Support**: Checks all Ubuntu repository components (main, restricted, universe, multiverse)
 - **Multi-Pocket Coverage**: Verifies packages across all repository pockets (main, security, updates)
-- **Recursive Dependency Analysis**: Optional full recursive check of all transitive dependencies
+- **Version-Specific Checking**: Test specific package versions or the latest version
+- **Intelligent Caching**: Caches downloaded packages with server validation (HEAD requests) to avoid unnecessary downloads
+- **Recursive Dependency Analysis**: Optional full recursive check of all transitive dependencies with proper version constraint handling
+- **Version Constraint Handling**: Respects Debian version constraints (e.g., `= X.Y.Z`) when checking dependencies
 - **Auto-Detection**: Automatically detects the Ubuntu version or accepts manual specification for cross-version checking
 - **Flexible Filtering**: Select specific components to check
 - **Detailed Output**: Shows which repository source (component/pocket) each package comes from
@@ -55,6 +58,20 @@ python3 check_kernel_availability.py
 python3 check_kernel_availability.py --package linux-image-generic
 ```
 
+### Check Specific Package Version
+
+Test a particular version of a package:
+
+```bash
+python3 check_kernel_availability.py --package-version 6.8.0-94.96
+python3 check_kernel_availability.py -pv 6.8.0-100.100
+```
+
+This is useful for:
+- Tracking when availability issues started or were fixed
+- Testing different versions across different pockets
+- Verifying version-specific dependency resolution
+
 ### Cross-Version Check
 
 ```bash
@@ -80,6 +97,24 @@ python3 check_kernel_availability.py --components main universe
 python3 check_kernel_availability.py -c main restricted
 ```
 
+### Caching
+
+The tool automatically caches downloaded package metadata with server validation:
+
+```bash
+# Use cache (default) - validates freshness with server
+python3 check_kernel_availability.py
+
+# Skip cache and force fresh download
+python3 check_kernel_availability.py --no-cache
+```
+
+Caching benefits:
+- **Fast**: ~1 second with cache vs ~3.3 seconds without
+- **Smart**: Uses HEAD requests to validate cache freshness
+- **Transparent**: Automatically re-downloads if server has newer version
+- **Space-efficient**: Stores metadata in compressed `.gz` format
+
 ### Verbose Output
 
 Show detailed information about each dependency:
@@ -95,11 +130,14 @@ python3 check_kernel_availability.py -v
 # Full recursive check with verbose output
 python3 check_kernel_availability.py --recursive --verbose
 
+# Check specific version with recursive dependencies
+python3 check_kernel_availability.py -pv 6.8.0-94.96 -r -v
+
 # Check universe packages on focal with short flags
 python3 check_kernel_availability.py -r -v -u focal -c universe
 
-# Check specific package across all components
-python3 check_kernel_availability.py -p linux-image-generic --components main universe
+# Check specific package version, skip cache, force fresh download
+python3 check_kernel_availability.py -pv 6.8.0-100.100 --no-cache -r
 ```
 
 ## Output Examples
@@ -130,10 +168,10 @@ Downloading packages from repository...
 ✓ Downloaded from 12 sources
 ✓ Total unique packages available: 93736
 
-Checking package: linux-generic
+Checking package: linux-generic (latest)
 ✓ Package found
-  Version: 6.8.0-31.31
-  Source: main/main
+  Version: 6.8.0-100.100
+  Source: main/updates
   Architecture: amd64
 
 Checking dependencies...
@@ -177,14 +215,20 @@ Packages Missing from Repository:
 
 ## How It Works
 
-1. Detects the Ubuntu version from `/etc/os-release` or accepts a manual specification
-2. Downloads the compressed `Packages.gz` metadata files from archive.ubuntu.com for:
+1. **Version Detection**: Detects the Ubuntu version from `/etc/os-release` or accepts manual specification
+2. **Smart Caching**: Checks if cached package metadata is current using HEAD requests to validate server timestamps
+3. **Package Download**: Downloads compressed `Packages.gz` metadata files from archive.ubuntu.com for:
    - All requested components (main, restricted, universe, multiverse)
    - All pockets (main, security, updates)
-3. Parses the package metadata to build a database of available packages
-4. Checks if the target package and its dependencies exist in the database
-5. Optionally performs recursive checking to validate the entire dependency tree
-6. Generates a detailed report showing which packages are missing or available
+4. **Version Selection**:
+   - Uses latest available version if not specified
+   - Uses specific version if requested with `--package-version`
+5. **Dependency Parsing**: Parses package metadata and respects version constraints in dependencies
+   - Handles equality constraints like `(= X.Y.Z)`
+   - Recursively validates version-specific dependencies
+6. **Dependency Checking**: Validates the target package and its dependencies exist in the database
+7. **Optional Recursion**: Performs full recursive checking of transitive dependencies if requested
+8. **Report Generation**: Produces detailed output showing which packages are missing or available
 
 ## Exit Codes
 
@@ -194,22 +238,26 @@ Packages Missing from Repository:
 ## Command-Line Reference
 
 ```
-usage: check_kernel_availability.py [-h] [-p PACKAGE] [-u UBUNTU_VERSION]
+usage: check_kernel_availability.py [-h] [-p PACKAGE] [-pv PACKAGE_VERSION]
+                                     [-u UBUNTU_VERSION]
                                      [-c {main,restricted,universe,multiverse} ...]
-                                     [-v] [-r]
+                                     [-v] [-r] [--no-cache]
 
 Check Ubuntu kernel package availability by querying archive.ubuntu.com
 
 optional arguments:
-  -h, --help            show this help message and exit
+  -h, --help            Show this help message and exit
   -p, --package PACKAGE
                         Package to check (default: linux-generic)
+  -pv, --package-version PACKAGE_VERSION
+                        Specific package version to check (default: latest)
   -u, --ubuntu-version UBUNTU_VERSION
                         Ubuntu version codename (e.g., focal, jammy, noble)
   -c, --components {main,restricted,universe,multiverse} ...
                         Repository components to check (default: all)
   -v, --verbose         Enable verbose output
   -r, --recursive       Perform full recursive check of all transitive dependencies
+  --no-cache            Skip cache and download fresh packages data
 ```
 
 ## Supported Ubuntu Versions
@@ -220,12 +268,39 @@ The tool works with any Ubuntu version that has repositories on archive.ubuntu.c
 - noble (24.04 LTS)
 - And all other currently maintained and archived Ubuntu releases
 
+## Advanced Features
+
+### Version Constraint Handling
+
+The tool properly respects Debian version constraints in package dependencies. This ensures accurate dependency resolution:
+
+```bash
+# Example: linux-generic 6.8.0-94.96 depends on linux-image-generic (= 6.8.0-94.96)
+# The tool will check the specific version, not the latest
+
+./check_kernel_availability.py -pv 6.8.0-94.96
+# ✓ Finds linux-image-generic 6.8.0-94.96
+# ✓ Checks its dependencies with correct versions
+# ✓ ALL CHECKS PASSED (if dependencies are available)
+```
+
+### Caching with Server Validation
+
+Packages are cached locally for speed, but the tool validates freshness:
+
+```bash
+# Cache directory: ./cache/
+# Format: {ubuntu_version}_{pocket}_{component}.gz
+# Validation: Uses HEAD requests to check Last-Modified headers
+```
+
 ## Limitations
 
 - Requires internet connectivity to archive.ubuntu.com
 - Only checks for package existence, not actual package installability on the system
 - Does not validate package integrity or signatures
 - Cannot check PPAs or third-party repositories
+- Checks only the main package architecture (amd64); other architectures require custom queries
 
 ## License
 
