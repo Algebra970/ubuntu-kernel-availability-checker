@@ -287,6 +287,45 @@ def parse_packages_file(content: str) -> Dict[str, Dict[str, any]]:
     return packages
 
 
+def compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare two Debian package versions
+
+    Args:
+        v1: First version string
+        v2: Second version string
+
+    Returns:
+        -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+    """
+    # Simple comparison: split by '.' and compare numerically
+    # For accurate Debian version comparison, would need dpkg.version
+    # But this handles most cases like 6.8.0-31.31 vs 6.8.0-100.100
+    parts1 = re.split(r'[-.]', v1)
+    parts2 = re.split(r'[-.]', v2)
+
+    for p1, p2 in zip(parts1, parts2):
+        try:
+            num1, num2 = int(p1), int(p2)
+            if num1 < num2:
+                return -1
+            elif num1 > num2:
+                return 1
+        except ValueError:
+            # Fallback to string comparison for non-numeric parts
+            if p1 < p2:
+                return -1
+            elif p1 > p2:
+                return 1
+
+    # If all parts match, compare lengths
+    if len(parts1) < len(parts2):
+        return -1
+    elif len(parts1) > len(parts2):
+        return 1
+    return 0
+
+
 def parse_dependencies(depends_str: str) -> List[str]:
     """
     Parse Depends field from package metadata
@@ -481,14 +520,19 @@ def check_kernel_package(package: str = 'linux-generic',
             packages_content = download_packages_file(ubuntu_version, pocket, component=component, use_cache=use_cache)
             if packages_content:
                 pocket_packages = parse_packages_file(packages_content)
-                # Merge packages
+                # Merge packages, preferring newer versions
                 for pkg_name, pkg_info in pocket_packages.items():
                     if pkg_name not in all_packages:
                         all_packages[pkg_name] = pkg_info
                         package_sources[pkg_name] = f"{component}/{pocket}"
                     else:
-                        # Keep existing - first found is kept
-                        pass
+                        # Compare versions and keep the newer one
+                        existing_version = all_packages[pkg_name].get('Version', '')
+                        new_version = pkg_info.get('Version', '')
+                        if compare_versions(existing_version, new_version) < 0:
+                            # New version is newer
+                            all_packages[pkg_name] = pkg_info
+                            package_sources[pkg_name] = f"{component}/{pocket}"
                 download_count += 1
                 if not verbose:
                     print(f"  {Color.GREEN}✓{Color.END} {component:12} / {pocket:8} - {len(pocket_packages):5} packages")
