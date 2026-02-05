@@ -17,7 +17,9 @@ import gzip
 import re
 import argparse
 import sys
+import os
 from typing import Dict, List, Set, Tuple, Optional
+from pathlib import Path
 
 
 class Color:
@@ -30,6 +32,122 @@ class Color:
     CYAN = '\033[96m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+def get_cache_dir() -> Path:
+    """
+    Get or create the cache directory
+
+    Returns:
+        Path to the cache directory
+    """
+    cache_dir = Path.cwd() / 'cache'
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir
+
+
+def get_cache_path(ubuntu_version: str, pocket: str, component: str) -> Path:
+    """
+    Get the cache file path for a packages file
+
+    Args:
+        ubuntu_version: Ubuntu codename
+        pocket: Repository pocket
+        component: Repository component
+
+    Returns:
+        Path to the cache file
+    """
+    cache_dir = get_cache_dir()
+    filename = f"{ubuntu_version}_{pocket}_{component}.gz"
+    return cache_dir / filename
+
+
+def is_cache_current(ubuntu_version: str, pocket: str, component: str, arch: str = 'amd64') -> bool:
+    """
+    Check if cached file is still current by comparing with server's Last-Modified header
+
+    Args:
+        ubuntu_version: Ubuntu codename
+        pocket: Repository pocket
+        component: Repository component
+        arch: Architecture (default: amd64)
+
+    Returns:
+        True if cache is current, False if stale or doesn't exist
+    """
+    cache_path = get_cache_path(ubuntu_version, pocket, component)
+    if not cache_path.exists():
+        return False
+
+    # Build the URL
+    if pocket == 'main':
+        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}/{component}/binary-{arch}/Packages.gz"
+    else:
+        url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}-{pocket}/{component}/binary-{arch}/Packages.gz"
+
+    try:
+        # Make HEAD request to get Last-Modified header
+        req = urllib.request.Request(url, method='HEAD')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if 'Last-Modified' not in response.headers:
+                # Can't determine freshness, assume cache is stale
+                return False
+
+            server_modified = response.headers['Last-Modified']
+            # Parse Last-Modified header (e.g., "Wed, 21 Oct 2024 07:28:00 GMT")
+            from email.utils import parsedate_to_datetime
+            server_time = parsedate_to_datetime(server_modified).timestamp()
+            cache_time = cache_path.stat().st_mtime
+
+            # Cache is current if it's newer than or equal to server's file
+            return cache_time >= server_time
+    except Exception:
+        # If HEAD request fails, assume cache is current to avoid re-downloading
+        return cache_path.exists()
+
+
+def load_from_cache(ubuntu_version: str, pocket: str, component: str) -> Optional[str]:
+    """
+    Load decompressed packages data from cache if available and current
+
+    Args:
+        ubuntu_version: Ubuntu codename
+        pocket: Repository pocket
+        component: Repository component
+
+    Returns:
+        Decompressed Packages file content or None if not cached or stale
+    """
+    if not is_cache_current(ubuntu_version, pocket, component):
+        return None
+
+    cache_path = get_cache_path(ubuntu_version, pocket, component)
+    if cache_path.exists():
+        try:
+            with gzip.open(cache_path, 'rb') as f:
+                return f.read().decode('utf-8')
+        except Exception:
+            return None
+    return None
+
+
+def save_to_cache(ubuntu_version: str, pocket: str, component: str, content: str) -> None:
+    """
+    Save decompressed packages data to cache
+
+    Args:
+        ubuntu_version: Ubuntu codename
+        pocket: Repository pocket
+        component: Repository component
+        content: Decompressed Packages file content
+    """
+    cache_path = get_cache_path(ubuntu_version, pocket, component)
+    try:
+        with gzip.open(cache_path, 'wb') as f:
+            f.write(content.encode('utf-8'))
+    except Exception:
+        pass  # Silently fail if caching doesn't work
 
 
 def detect_ubuntu_codename() -> Optional[str]:
@@ -64,19 +182,27 @@ def detect_ubuntu_codename() -> Optional[str]:
 
 def download_packages_file(ubuntu_version: str, pocket: str = 'main',
                           arch: str = 'amd64',
-                          component: str = 'main') -> Optional[str]:
+                          component: str = 'main',
+                          use_cache: bool = True) -> Optional[str]:
     """
-    Download and decompress Packages file from Ubuntu repository
+    Download and decompress Packages file from Ubuntu repository with optional caching
 
     Args:
         ubuntu_version: Ubuntu codename (e.g., 'focal', 'jammy')
         pocket: Repository pocket ('main', 'security', 'updates')
         arch: Architecture (default: amd64)
         component: Repository component ('main', 'restricted', 'universe', 'multiverse')
+        use_cache: Use cached data if available (default: True)
 
     Returns:
         Decompressed Packages file content or None if download fails
     """
+    # Try cache first if enabled
+    if use_cache:
+        cached_content = load_from_cache(ubuntu_version, pocket, component)
+        if cached_content:
+            return cached_content
+
     # Build the URL based on the pocket
     if pocket == 'main':
         url = f"http://archive.ubuntu.com/ubuntu/dists/{ubuntu_version}/{component}/binary-{arch}/Packages.gz"
@@ -89,6 +215,11 @@ def download_packages_file(ubuntu_version: str, pocket: str = 'main',
 
         # Decompress gzip data
         decompressed = gzip.decompress(compressed_data).decode('utf-8')
+
+        # Save to cache
+        if use_cache:
+            save_to_cache(ubuntu_version, pocket, component, decompressed)
+
         return decompressed
     except urllib.error.HTTPError as e:
         # Silently return None for 404 errors (component/pocket might not exist)
@@ -232,7 +363,8 @@ def check_kernel_package(package: str = 'linux-generic',
                         ubuntu_version: Optional[str] = None,
                         verbose: bool = False,
                         recursive: bool = False,
-                        components: Optional[List[str]] = None) -> bool:
+                        components: Optional[List[str]] = None,
+                        use_cache: bool = True) -> bool:
     """
     Main function to check kernel package and dependencies
 
@@ -242,6 +374,7 @@ def check_kernel_package(package: str = 'linux-generic',
         verbose: Print verbose output
         recursive: Check all transitive dependencies recursively
         components: List of components to check (default: all)
+        use_cache: Use cached data if available (default: True)
 
     Returns:
         True if all checks pass, False otherwise
@@ -277,7 +410,7 @@ def check_kernel_package(package: str = 'linux-generic',
 
     for component in components:
         for pocket in pockets:
-            packages_content = download_packages_file(ubuntu_version, pocket, component=component)
+            packages_content = download_packages_file(ubuntu_version, pocket, component=component, use_cache=use_cache)
             if packages_content:
                 pocket_packages = parse_packages_file(packages_content)
                 # Merge packages
@@ -471,6 +604,9 @@ Examples:
   # Full recursive check of all transitive dependencies
   python3 check_kernel_availability.py --recursive
 
+  # Skip cache and download fresh data
+  python3 check_kernel_availability.py --no-cache
+
   # Verbose output
   python3 check_kernel_availability.py --verbose
 
@@ -511,10 +647,16 @@ Examples:
         help='Perform full recursive check of all transitive dependencies'
     )
 
+    parser.add_argument(
+        '--no-cache',
+        action='store_true',
+        help='Skip cache and download fresh packages data from repository'
+    )
+
     args = parser.parse_args()
 
     # Run the check
-    success = check_kernel_package(args.package, args.ubuntu_version, args.verbose, args.recursive, args.components)
+    success = check_kernel_package(args.package, args.ubuntu_version, args.verbose, args.recursive, args.components, not args.no_cache)
 
     # Exit with appropriate code
     sys.exit(0 if success else 1)
