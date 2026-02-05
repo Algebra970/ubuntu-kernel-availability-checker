@@ -14,12 +14,10 @@ Usage:
 import urllib.request
 import urllib.error
 import gzip
-import io
 import re
 import argparse
 import sys
 from typing import Dict, List, Set, Tuple, Optional
-from pathlib import Path
 
 
 class Color:
